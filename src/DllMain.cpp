@@ -3,9 +3,6 @@
 #include <psapi.h>
 #include <vector>
 #include <thread>
-#include <string>
-#include <fstream>
-#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -45,20 +42,29 @@ static uintptr_t GetModuleBaseAddress(const wchar_t* moduleName) {
     return 0;
 }
 
+static bool IsGamePaused(uintptr_t gameBase) {
+    uintptr_t pauseFlagAddr = gameBase + 0x4384B8;
+    if (IsBadReadPtr(reinterpret_cast<void*>(pauseFlagAddr), sizeof(short))) {
+        return false;
+    }
+    short pauseValue = *reinterpret_cast<short*>(pauseFlagAddr);
+    return pauseValue == 1;
+}
+
 static void NitrousUpdaterThread() {
     uintptr_t gameBase = GetModuleBaseAddress(L"SPEED2.exe");
     if (gameBase == 0) return;
 
     std::vector<PointerChain> nitrousChains = {
         { 0x46B2F0, {0x60, 0x4, 0x4, 0x4, 0x4, 0x1BC, 0x41C} },
-        { 0x46B2F0, {0x34, 0x18, 0x8, 0x1A0, 0x4, 0x1BC, 0x41C} },
-        { 0x46B2F0, {0x54, 0x4, 0xC4, 0x1A0, 0x4, 0x1BC, 0x41C} },
-        { 0x49CDA8, {0x48, 0x4, 0x20, 0x4, 0xC0, 0x1BC, 0x41C} },
-        { 0x49CCF8, {0x34, 0x44, 0x4, 0x14, 0x8, 0x1BC, 0x41C} }
+        { 0x49CDA8, {0x48, 0x4, 0x20, 0x4, 0xC0, 0x1BC, 0x41C} }
     };
 
-    Sleep(10000);
+    PointerChain speedPointer = { 0x4B4740, {0x114, 0x20, 0x3A8, 0x8, 0xC, 0x20, 0x44} };
 
+    PointerChain maxNitrousPointer = { 0x49CCF8, {0x454} };
+
+    Sleep(10000);
     const int incrementAmount = 15;
     const int updateIntervalMs = 50;
     const DWORD cooldownMs = 2000;
@@ -66,38 +72,40 @@ static void NitrousUpdaterThread() {
     std::unordered_map<uintptr_t, int> lastValues;
     std::unordered_map<uintptr_t, ULONGLONG> cooldownTimestamps;
     std::unordered_map<uintptr_t, int> maxValues;
-    std::unordered_map<uintptr_t, ULONGLONG> firstSeenTimestamps;
 
     while (true) {
         ULONGLONG now = GetTickCount64();
-        std::unordered_set<uintptr_t> updatedThisFrame;
 
+        if (IsGamePaused(gameBase)) {
+            Sleep(updateIntervalMs);
+            continue;
+        }
+
+        uintptr_t maxNitrousAddr = ResolvePointer(gameBase, maxNitrousPointer);
+        if (maxNitrousAddr != 0 && !IsBadReadPtr(reinterpret_cast<void*>(maxNitrousAddr), sizeof(int))) {
+            maxValues[0] = *reinterpret_cast<int*>(maxNitrousAddr);
+        }
+
+        uintptr_t speedAddr = ResolvePointer(gameBase, speedPointer);
+        int carSpeed = (speedAddr != 0 && !IsBadReadPtr(reinterpret_cast<void*>(speedAddr), sizeof(int)))
+            ? *reinterpret_cast<int*>(speedAddr)
+            : -1;
+
+        std::unordered_set<uintptr_t> updatedThisFrame;
         for (const auto& chain : nitrousChains) {
             uintptr_t addr = ResolvePointer(gameBase, chain);
-            if (addr == 0 ||
-                IsBadReadPtr(reinterpret_cast<void*>(addr), sizeof(int)) ||
-                IsBadWritePtr(reinterpret_cast<void*>(addr), sizeof(int))) {
+            if (addr == 0 || IsBadReadPtr(reinterpret_cast<void*>(addr), sizeof(int))) {
                 continue;
             }
 
             int currentValue = *reinterpret_cast<int*>(addr);
-            if (currentValue < 0 || currentValue > 30000) continue;
+            if (currentValue < 0 || currentValue > 99999) continue;
 
             int& lastValue = lastValues[addr];
             ULONGLONG& lastDecreaseTime = cooldownTimestamps[addr];
-            ULONGLONG& firstSeen = firstSeenTimestamps[addr];
-            int& maxValue = maxValues[addr];
+            int& maxValue = maxValues[0];
 
-            if (firstSeen == 0) {
-                firstSeen = now;
-                maxValue = 0;
-            }
-
-            if ((now - firstSeen) < 10) {
-                if (currentValue >= 1000 && currentValue <= 30000 && currentValue > maxValue) {
-                    maxValue = currentValue;
-                }
-            }
+            if (carSpeed >= 0 && carSpeed < 50) continue;
 
             if (currentValue < lastValue) {
                 lastDecreaseTime = now;
