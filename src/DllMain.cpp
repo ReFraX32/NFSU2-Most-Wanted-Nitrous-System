@@ -61,11 +61,8 @@ static void NitrousUpdaterThread() {
     };
 
     PointerChain speedPointer = { 0x4B4740, {0x114, 0x20, 0x3A8, 0x8, 0xC, 0x20, 0x44} };
-
     PointerChain maxNitrousPointer = { 0x49CCF8, {0x454} };
 
-    Sleep(10000);
-    const int incrementAmount = 15;
     const int updateIntervalMs = 50;
     const DWORD cooldownMs = 2000;
 
@@ -91,6 +88,11 @@ static void NitrousUpdaterThread() {
             ? *reinterpret_cast<int*>(speedAddr)
             : -1;
 
+        double refillTime = 50.0 - ((carSpeed - 50) * 20.0 / 50.0);
+        refillTime = std::max(30.0, std::min(refillTime, 50.0));
+
+        int refillIncrement = static_cast<int>(maxValues[0] / (refillTime * 20));
+
         std::unordered_set<uintptr_t> updatedThisFrame;
         for (const auto& chain : nitrousChains) {
             uintptr_t addr = ResolvePointer(gameBase, chain);
@@ -105,14 +107,14 @@ static void NitrousUpdaterThread() {
             ULONGLONG& lastDecreaseTime = cooldownTimestamps[addr];
             int& maxValue = maxValues[0];
 
-            if (carSpeed >= 0 && carSpeed < 50) continue;
-
             if (currentValue < lastValue) {
                 lastDecreaseTime = now;
             }
+
             lastValue = currentValue;
 
             if ((now - lastDecreaseTime) < cooldownMs) continue;
+            if (carSpeed >= 0 && carSpeed < 50) continue;
 
             bool alreadyHandled = false;
             for (uintptr_t seenAddr : updatedThisFrame) {
@@ -123,7 +125,7 @@ static void NitrousUpdaterThread() {
             }
 
             if (!alreadyHandled && currentValue < maxValue) {
-                *reinterpret_cast<int*>(addr) = std::min(currentValue + incrementAmount, maxValue);
+                *reinterpret_cast<int*>(addr) = std::min(currentValue + refillIncrement, maxValue);
                 updatedThisFrame.insert(addr);
             }
         }
