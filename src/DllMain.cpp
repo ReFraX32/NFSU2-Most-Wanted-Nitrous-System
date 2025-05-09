@@ -5,6 +5,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <string>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -12,6 +13,9 @@ struct PointerChain {
     DWORD baseOffset;
     std::vector<DWORD> offsets;
 };
+
+static bool g_doubleNitrous = false;
+static bool g_fastRefill = false;
 
 static uintptr_t ResolvePointer(uintptr_t base, const PointerChain& chain) {
     uintptr_t addr = base + chain.baseOffset;
@@ -51,6 +55,39 @@ static bool IsGamePaused(uintptr_t gameBase) {
     return pauseValue == 1;
 }
 
+static void LoadConfig(const std::wstring& iniPath) {
+    wchar_t buffer[8] = { 0 };
+
+    DWORD attrs = GetFileAttributesW(iniPath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        FILE* f;
+        _wfopen_s(&f, iniPath.c_str(), L"w, ccs=UTF-8");
+        if (f) {
+            fwprintf(f,
+                L"; NFSU2 Most Wanted Nitrous System Configuration\n"
+                L"; ================================================\n"
+                L"\n"
+                L"[Settings]\n"
+                L"\n"
+                L"DoubleNitrous = 0    ; Doubles maximum nitrous capacity for longer use (refills both bars). (0 = Off, 1 = On)\n"
+                L"FastRefill    = 0    ; Speeds up nitrous refill and shortens cooldown after use.            (0 = Off, 1 = On)\n"
+            );
+            fclose(f);
+        }
+        else {
+            g_doubleNitrous = false;
+            g_fastRefill = false;
+            return;
+        }
+    }
+
+    GetPrivateProfileStringW(L"Settings", L"DoubleNitrous", L"0", buffer, 8, iniPath.c_str());
+    g_doubleNitrous = wcstol(buffer, nullptr, 10) != 0;
+
+    GetPrivateProfileStringW(L"Settings", L"FastRefill", L"0", buffer, 8, iniPath.c_str());
+    g_fastRefill = wcstol(buffer, nullptr, 10) != 0;
+}
+
 static void NitrousUpdaterThread() {
     uintptr_t gameBase = GetModuleBaseAddress(L"SPEED2.exe");
     if (gameBase == 0) return;
@@ -64,14 +101,25 @@ static void NitrousUpdaterThread() {
     PointerChain maxNitrousPointer = { 0x49CCF8, {0x454} };
 
     const int updateIntervalMs = 50;
-    const DWORD cooldownMs = 2000;
+    const DWORD cooldownMs = g_fastRefill ? 1000 : 2000;
 
     std::unordered_map<uintptr_t, int> lastValues;
     std::unordered_map<uintptr_t, ULONGLONG> cooldownTimestamps;
     std::unordered_map<uintptr_t, int> maxValues;
 
+    ULONGLONG lastUpdateTime = GetTickCount64();
+
     while (true) {
         ULONGLONG now = GetTickCount64();
+        ULONGLONG elapsedTime = now - lastUpdateTime;
+
+        if (elapsedTime < updateIntervalMs) {
+            DWORD sleepDuration = static_cast<DWORD>(updateIntervalMs - elapsedTime);
+            Sleep(sleepDuration);
+            continue;
+        }
+
+        lastUpdateTime = now;
 
         if (IsGamePaused(gameBase)) {
             Sleep(updateIntervalMs);
@@ -88,10 +136,32 @@ static void NitrousUpdaterThread() {
             ? *reinterpret_cast<int*>(speedAddr)
             : -1;
 
-        double refillTime = 50.0 - ((carSpeed - 50) * 20.0 / 50.0);
-        refillTime = std::max(30.0, std::min(refillTime, 50.0));
+        double refillTime;
 
-        int refillIncrement = static_cast<int>(maxValues[0] / (refillTime * 20));
+        if (g_fastRefill) {
+            const int minSpeed = 10;
+            const int maxSpeed = 200;
+            const double minTime = 55.0;
+            const double maxTime = 15.0;
+
+            int clampedSpeed = std::max(minSpeed, std::min(carSpeed, maxSpeed));
+            double t = (clampedSpeed - minSpeed) / static_cast<double>(maxSpeed - minSpeed);
+            refillTime = minTime + t * (maxTime - minTime);
+        }
+        else {
+            const int minSpeed = 50;
+            const int maxSpeed = 100;
+            const double minTime = 50.0;
+            const double maxTime = 30.0;
+
+            int clampedSpeed = std::max(minSpeed, std::min(carSpeed, maxSpeed));
+            double t = (clampedSpeed - minSpeed) / static_cast<double>(maxSpeed - minSpeed);
+            refillTime = minTime + t * (maxTime - minTime);
+        }
+
+        int baseMax = maxValues[0];
+        int refillIncrement = static_cast<int>(baseMax / (refillTime * 20));
+        int actualMax = g_doubleNitrous ? baseMax * 2 : baseMax;
 
         std::unordered_set<uintptr_t> updatedThisFrame;
         for (const auto& chain : nitrousChains) {
@@ -105,7 +175,6 @@ static void NitrousUpdaterThread() {
 
             int& lastValue = lastValues[addr];
             ULONGLONG& lastDecreaseTime = cooldownTimestamps[addr];
-            int& maxValue = maxValues[0];
 
             if (currentValue < lastValue) {
                 lastDecreaseTime = now;
@@ -114,7 +183,8 @@ static void NitrousUpdaterThread() {
             lastValue = currentValue;
 
             if ((now - lastDecreaseTime) < cooldownMs) continue;
-            if (carSpeed >= 0 && carSpeed < 50) continue;
+
+            if (carSpeed >= 0 && carSpeed < 10) continue;
 
             bool alreadyHandled = false;
             for (uintptr_t seenAddr : updatedThisFrame) {
@@ -124,8 +194,8 @@ static void NitrousUpdaterThread() {
                 }
             }
 
-            if (!alreadyHandled && currentValue < maxValue) {
-                *reinterpret_cast<int*>(addr) = std::min(currentValue + refillIncrement, maxValue);
+            if (!alreadyHandled && currentValue < actualMax) {
+                *reinterpret_cast<int*>(addr) = std::min(currentValue + refillIncrement, actualMax);
                 updatedThisFrame.insert(addr);
             }
         }
@@ -135,6 +205,13 @@ static void NitrousUpdaterThread() {
 }
 
 static DWORD WINAPI MainThread(HMODULE hModule) {
+    wchar_t iniPath[MAX_PATH];
+    GetModuleFileNameW(hModule, iniPath, MAX_PATH);
+    *wcsrchr(iniPath, L'\\') = 0;
+    wcscat_s(iniPath, L"\\NFSU2MostWantedNitrousSystem.ini");
+
+    LoadConfig(iniPath);
+
     std::thread updater(NitrousUpdaterThread);
     updater.detach();
     return 0;
