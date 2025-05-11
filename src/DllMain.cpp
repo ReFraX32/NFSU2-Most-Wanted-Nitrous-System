@@ -102,12 +102,16 @@ static void NitrousUpdaterThread() {
 
     const int updateIntervalMs = 25;
     const DWORD cooldownMs = g_fastRefill ? 1000 : 2000;
+    const DWORD unpauseBufferMs = 500;
 
     std::unordered_map<uintptr_t, int> lastValues;
     std::unordered_map<uintptr_t, ULONGLONG> cooldownTimestamps;
     std::unordered_map<uintptr_t, int> maxValues;
 
     ULONGLONG lastUpdateTime = GetTickCount64();
+    ULONGLONG gameTime = 0;
+    bool wasGamePaused = false;
+    ULONGLONG unpauseTime = 0;
 
     while (true) {
         ULONGLONG now = GetTickCount64();
@@ -118,9 +122,27 @@ static void NitrousUpdaterThread() {
             continue;
         }
 
-        lastUpdateTime = now;
+        bool isGamePaused = IsGamePaused(gameBase);
 
-        if (IsGamePaused(gameBase)) {
+        if (wasGamePaused && !isGamePaused) {
+            unpauseTime = now;
+        }
+
+        if (!isGamePaused) {
+            if (!wasGamePaused) {
+                gameTime += elapsedTime;
+            }
+        }
+
+        lastUpdateTime = now;
+        wasGamePaused = isGamePaused;
+
+        if (isGamePaused) {
+            Sleep(updateIntervalMs);
+            continue;
+        }
+
+        if ((now - unpauseTime) < unpauseBufferMs) {
             Sleep(updateIntervalMs);
             continue;
         }
@@ -158,6 +180,10 @@ static void NitrousUpdaterThread() {
             uintptr_t addr = ResolvePointer(gameBase, chain);
             if (addr == 0 || IsBadReadPtr(reinterpret_cast<void*>(addr), sizeof(int))) continue;
 
+            if (IsGamePaused(gameBase) || ((now - unpauseTime) < unpauseBufferMs)) {
+                break;
+            }
+
             int currentValue = *reinterpret_cast<int*>(addr);
             if (currentValue < 0 || currentValue > 99999) continue;
 
@@ -165,12 +191,12 @@ static void NitrousUpdaterThread() {
             ULONGLONG& lastDecreaseTime = cooldownTimestamps[addr];
 
             if (currentValue < lastValue) {
-                lastDecreaseTime = now;
+                lastDecreaseTime = gameTime;
             }
 
             lastValue = currentValue;
 
-            if ((now - lastDecreaseTime) < cooldownMs) continue;
+            if ((gameTime - lastDecreaseTime) < cooldownMs) continue;
 
             bool alreadyHandled = false;
             for (uintptr_t seenAddr : updatedThisFrame) {
@@ -180,7 +206,7 @@ static void NitrousUpdaterThread() {
                 }
             }
 
-            if (!alreadyHandled && currentValue < actualMax) {
+            if (!IsGamePaused(gameBase) && ((now - unpauseTime) >= unpauseBufferMs) && !alreadyHandled && currentValue < actualMax) {
                 *reinterpret_cast<int*>(addr) = std::min(currentValue + refillIncrement, actualMax);
                 updatedThisFrame.insert(addr);
             }
