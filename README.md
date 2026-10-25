@@ -22,9 +22,3 @@ A `NFSU2MostWantedNitrousSystem.ini` file is created next to the mod with these 
 ## How it works technically
 
 The mod reads the game's own nitrous values (current amount, capacity, and boost state) directly from the car structures inside SPEED2.EXE, found by reverse engineering the game, so it does not depend on memory pointer chains that can break. Speed is read from the same value the speedometer displays, in the same units (mph or km/h) you have set in the game options.
-
-## Installation
-
-1. Install the Ultimate ASI Loader (dinput8.dll) into the game folder.
-2. Copy `NFSU2MostWantedNitrousSystem.asi` into the game folder, next to SPEED2.EXE.
-3. Launch the game and start a race.
