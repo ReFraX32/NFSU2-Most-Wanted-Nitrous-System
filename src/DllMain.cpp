@@ -1,59 +1,92 @@
 #define NOMINMAX
 #include <windows.h>
-#include <psapi.h>
-#include <vector>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
+#include <algorithm>
+#include <cstdio>
 #include <string>
+#include <thread>
 
-#pragma comment(lib, "psapi.lib")
+// ============================================================================
+// SPEED2.EXE (Need for Speed: Underground 2) static addresses.
+// Recovered by static reverse engineering (Ghidra) and cross-checked against
+// multiple call sites in the game itself. RVAs are relative to the SPEED2.EXE
+// module base (image base 0x400000).
+//
+// Racer roster (global array, RVA 0x49CCF8):
+//   roster[i]           DWORD  car entity pointer for racer slot i
+// Built by FUN_005f0d20, which sorts racers by type (local-player class first,
+// so roster[0] is the local player's entity) and writes each entity's short
+// slot index at entity+0x08.
+//
+// Car entity (the object in the roster; the CarState sub-structure is embedded
+// at entity+0x40, so CarState+0x414..0x420 == entity+0x454..0x460):
+//   +0x14        ptr    racer info; (int at racerinfo+4) is the racer type
+//   +0x430       float  display speed in m/s - the exact value the HUD
+//                        speedometer multiplies by 3.6 (km/h) or 2.237 (mph)
+//                        before rounding for the digital readout
+//   +0x454       int    nitrous capacity in fixed-point units
+//                        (0x7FFFFFFF sentinel = no nitrous / infinite)
+//   +0x458       int    nitrous drain per tick while boosting
+//   +0x45C       int    nitrous current amount in fixed-point units
+//   +0x460       int    boost-active reference (nonzero while boosting)
+// Fixed-point scale in the game code is 0.00025 (4000 units = 1 second of
+// boost); the game reads/writes these ints through fild/fistp.
+//
+// Other globals:
+//   RVA 0x4384B8  int    pause flag (1 = paused), see FUN_0052cdd0/FUN_0050c680
+//   RVA 0x49E7E6  byte   metric units option (nonzero = HUD shows km/h)
+// ============================================================================
+namespace game {
+    constexpr uintptr_t RACER_ROSTER    = 0x49CCF8;
+    constexpr uintptr_t PAUSE_FLAG      = 0x4384B8;
+    constexpr uintptr_t METRIC_UNITS    = 0x49E7E6;
 
-struct PointerChain {
-    DWORD baseOffset;
-    std::vector<DWORD> offsets;
-};
+    constexpr intptr_t  ENT_RACER_INFO  = 0x14;
+    constexpr intptr_t  ENT_SPEED_MS    = 0x430;
+    constexpr intptr_t  ENT_NITRO_MAX   = 0x454;
+    constexpr intptr_t  ENT_NITRO_CURRENT = 0x45C;
+    constexpr intptr_t  ENT_NITRO_BOOSTED = 0x460;
+
+    constexpr int NITRO_NO_SENTINEL = 0x7FFFFFFF;
+    constexpr int MAX_RACERS = 22;  // roster parallel arrays are 0x58 (22 slots) apart
+
+    static bool Readable(const void* p, size_t len) {
+        return p != nullptr && !IsBadReadPtr(p, len);
+    }
+
+    static bool IsGamePaused(uintptr_t base) {
+        const int* flag = reinterpret_cast<const int*>(base + PAUSE_FLAG);
+        return Readable(flag, 4) && *flag == 1;
+    }
+
+    static bool IsMetricUnits(uintptr_t base) {
+        const uint8_t* flag = reinterpret_cast<const uint8_t*>(base + METRIC_UNITS);
+        return Readable(flag, 1) && *flag != 0;
+    }
+
+    // Resolves the local player's car entity for this frame, or 0.
+    // The roster builder puts the local-player class (type 1) racer first.
+    static uintptr_t FindPlayerEntity(uintptr_t base) {
+        uintptr_t roster = base + RACER_ROSTER;
+        if (!Readable(reinterpret_cast<const void*>(roster), 4)) return 0;
+
+        uintptr_t ent = *reinterpret_cast<uintptr_t*>(roster);
+        if (ent == 0) return 0;
+        if (!Readable(reinterpret_cast<const void*>(ent + ENT_NITRO_CURRENT), 0x10)) return 0;
+
+        // Sanity: the player's racer info should report the local-player type.
+        if (Readable(reinterpret_cast<const void*>(ent + ENT_RACER_INFO), 8)) {
+            uintptr_t info = *reinterpret_cast<uintptr_t*>(ent + ENT_RACER_INFO);
+            if (info != 0 && Readable(reinterpret_cast<const void*>(info + 4), 4) &&
+                *reinterpret_cast<int*>(info + 4) != 1) {
+                return 0;
+            }
+        }
+        return ent;
+    }
+}
 
 static bool g_doubleNitrous = false;
 static bool g_fastRefill = false;
-
-static uintptr_t ResolvePointer(uintptr_t base, const PointerChain& chain) {
-    uintptr_t addr = base + chain.baseOffset;
-    for (size_t i = 0; i < chain.offsets.size(); ++i) {
-        if (IsBadReadPtr(reinterpret_cast<void*>(addr), sizeof(uintptr_t))) {
-            return 0;
-        }
-        addr = *reinterpret_cast<uintptr_t*>(addr);
-        addr += chain.offsets[i];
-    }
-    return addr;
-}
-
-static uintptr_t GetModuleBaseAddress(const wchar_t* moduleName) {
-    HMODULE hMods[1024];
-    HANDLE hProcess = GetCurrentProcess();
-    DWORD cbNeeded;
-    if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
-        for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
-            wchar_t szModName[MAX_PATH];
-            if (GetModuleBaseNameW(hProcess, hMods[i], szModName, MAX_PATH)) {
-                if (_wcsicmp(szModName, moduleName) == 0) {
-                    return reinterpret_cast<uintptr_t>(hMods[i]);
-                }
-            }
-        }
-    }
-    return 0;
-}
-
-static bool IsGamePaused(uintptr_t gameBase) {
-    uintptr_t pauseFlagAddr = gameBase + 0x4384B8;
-    if (IsBadReadPtr(reinterpret_cast<void*>(pauseFlagAddr), sizeof(short))) {
-        return false;
-    }
-    short pauseValue = *reinterpret_cast<short*>(pauseFlagAddr);
-    return pauseValue == 1;
-}
 
 static void LoadConfig(const std::wstring& iniPath) {
     wchar_t buffer[8] = { 0 };
@@ -89,24 +122,20 @@ static void LoadConfig(const std::wstring& iniPath) {
 }
 
 static void NitrousUpdaterThread() {
-    uintptr_t gameBase = GetModuleBaseAddress(L"SPEED2.exe");
+    HMODULE hGame = GetModuleHandleW(L"SPEED2.exe");
+    if (hGame == nullptr) {
+        // Ultimate ASI Loader may run us before SPEED2.exe is mapped under that name.
+        hGame = GetModuleHandleW(nullptr);
+    }
+    uintptr_t gameBase = reinterpret_cast<uintptr_t>(hGame);
     if (gameBase == 0) return;
-
-    std::vector<PointerChain> nitrousChains = {
-        { 0x46B2F0, {0x60, 0x4, 0x4, 0x4, 0x4, 0x1BC, 0x41C} },
-        { 0x49CDA8, {0x48, 0x4, 0x20, 0x4, 0xC0, 0x1BC, 0x41C} }
-    };
-
-    PointerChain speedPointer = { 0x4B4740, {0x114, 0x20, 0x3A8, 0x8, 0xC, 0x20, 0x44} };
-    PointerChain maxNitrousPointer = { 0x49CCF8, {0x454} };
 
     const int updateIntervalMs = 25;
     const DWORD cooldownMs = g_fastRefill ? 1000 : 2000;
     const DWORD unpauseBufferMs = 500;
 
-    std::unordered_map<uintptr_t, int> lastValues;
-    std::unordered_map<uintptr_t, ULONGLONG> cooldownTimestamps;
-    std::unordered_map<uintptr_t, int> maxValues;
+    int lastNitroValue = -1;
+    ULONGLONG lastDecreaseTime = 0;
 
     ULONGLONG lastUpdateTime = GetTickCount64();
     ULONGLONG gameTime = 0;
@@ -122,7 +151,7 @@ static void NitrousUpdaterThread() {
             continue;
         }
 
-        bool isGamePaused = IsGamePaused(gameBase);
+        bool isGamePaused = game::IsGamePaused(gameBase);
 
         if (wasGamePaused && !isGamePaused) {
             unpauseTime = now;
@@ -147,15 +176,44 @@ static void NitrousUpdaterThread() {
             continue;
         }
 
-        uintptr_t maxNitrousAddr = ResolvePointer(gameBase, maxNitrousPointer);
-        if (maxNitrousAddr != 0 && !IsBadReadPtr(reinterpret_cast<void*>(maxNitrousAddr), sizeof(int))) {
-            maxValues[0] = *reinterpret_cast<int*>(maxNitrousAddr);
+        uintptr_t ent = game::FindPlayerEntity(gameBase);
+        if (ent == 0) {
+            lastNitroValue = -1;
+            Sleep(updateIntervalMs);
+            continue;
         }
 
-        uintptr_t speedAddr = ResolvePointer(gameBase, speedPointer);
-        int carSpeed = (speedAddr != 0 && !IsBadReadPtr(reinterpret_cast<void*>(speedAddr), sizeof(int)))
-            ? *reinterpret_cast<int*>(speedAddr)
-            : -1;
+        const int maxNitro = *reinterpret_cast<int*>(ent + game::ENT_NITRO_MAX);
+        if (maxNitro <= 0 || maxNitro == game::NITRO_NO_SENTINEL) {
+            // No nitrous equipped on this car.
+            lastNitroValue = -1;
+            Sleep(updateIntervalMs);
+            continue;
+        }
+
+        const uintptr_t nitroAddr = ent + game::ENT_NITRO_CURRENT;
+        int currentValue = *reinterpret_cast<int*>(nitroAddr);
+        // Allow up to 2x capacity: the DoubleNitrous option overfills past the
+        // normal max (the game bleeds the overfill back down itself).
+        if (currentValue < 0 || currentValue > maxNitro * 2) {
+            lastNitroValue = -1;
+            Sleep(updateIntervalMs);
+            continue;
+        }
+
+        // The game drains this field while boosting; treat any drop (or an
+        // active boost, flagged by the game at +0x460) as nitrous usage and
+        // restart the refill cooldown.
+        const bool boosting = *reinterpret_cast<int*>(ent + game::ENT_NITRO_BOOSTED) != 0;
+        if (boosting || (lastNitroValue >= 0 && currentValue < lastNitroValue)) {
+            lastDecreaseTime = gameTime;
+        }
+        lastNitroValue = currentValue;
+
+        // Speed as displayed on the HUD (mph or km/h depending on game options).
+        const float speedMs = *reinterpret_cast<float*>(ent + game::ENT_SPEED_MS);
+        const float unitScale = game::IsMetricUnits(gameBase) ? 3.6f : 2.237f;
+        const int carSpeed = static_cast<int>(speedMs * unitScale);
 
         int minSpeed = g_fastRefill ? 20 : 50;
         int maxSpeed = g_fastRefill ? 140 : 100;
@@ -171,45 +229,13 @@ static void NitrousUpdaterThread() {
         double t = (clampedSpeed - minSpeed) / static_cast<double>(maxSpeed - minSpeed);
         double refillTime = minTime + t * (maxTime - minTime);
 
-        int baseMax = maxValues[0];
-        int refillIncrement = static_cast<int>(baseMax / (refillTime * 40));
-        int actualMax = g_doubleNitrous ? baseMax * 2 : baseMax;
+        // 40 updates per second, so the increment restores a full bar in
+        // refillTime seconds of sustained speed.
+        int refillIncrement = static_cast<int>(maxNitro / (refillTime * 40));
+        int actualMax = g_doubleNitrous ? maxNitro * 2 : maxNitro;
 
-        std::unordered_set<uintptr_t> updatedThisFrame;
-        for (const auto& chain : nitrousChains) {
-            uintptr_t addr = ResolvePointer(gameBase, chain);
-            if (addr == 0 || IsBadReadPtr(reinterpret_cast<void*>(addr), sizeof(int))) continue;
-
-            if (IsGamePaused(gameBase) || ((now - unpauseTime) < unpauseBufferMs)) {
-                break;
-            }
-
-            int currentValue = *reinterpret_cast<int*>(addr);
-            if (currentValue < 0 || currentValue > 99999) continue;
-
-            int& lastValue = lastValues[addr];
-            ULONGLONG& lastDecreaseTime = cooldownTimestamps[addr];
-
-            if (currentValue < lastValue) {
-                lastDecreaseTime = gameTime;
-            }
-
-            lastValue = currentValue;
-
-            if ((gameTime - lastDecreaseTime) < cooldownMs) continue;
-
-            bool alreadyHandled = false;
-            for (uintptr_t seenAddr : updatedThisFrame) {
-                if (*reinterpret_cast<int*>(seenAddr) == currentValue) {
-                    alreadyHandled = true;
-                    break;
-                }
-            }
-
-            if (!IsGamePaused(gameBase) && ((now - unpauseTime) >= unpauseBufferMs) && !alreadyHandled && currentValue < actualMax) {
-                *reinterpret_cast<int*>(addr) = std::min(currentValue + refillIncrement, actualMax);
-                updatedThisFrame.insert(addr);
-            }
+        if ((gameTime - lastDecreaseTime) >= cooldownMs && currentValue < actualMax) {
+            *reinterpret_cast<int*>(nitroAddr) = std::min(currentValue + refillIncrement, actualMax);
         }
 
         Sleep(updateIntervalMs);
