@@ -38,7 +38,6 @@
 namespace game {
     constexpr uintptr_t RACER_ROSTER    = 0x49CCF8;
     constexpr uintptr_t PAUSE_FLAG      = 0x4384B8;
-    constexpr uintptr_t METRIC_UNITS    = 0x49E7E6;
 
     constexpr intptr_t  ENT_RACER_INFO  = 0x14;
     constexpr intptr_t  ENT_SPEED_MS    = 0x430;
@@ -56,11 +55,6 @@ namespace game {
     static bool IsGamePaused(uintptr_t base) {
         const int* flag = reinterpret_cast<const int*>(base + PAUSE_FLAG);
         return Readable(flag, 4) && *flag == 1;
-    }
-
-    static bool IsMetricUnits(uintptr_t base) {
-        const uint8_t* flag = reinterpret_cast<const uint8_t*>(base + METRIC_UNITS);
-        return Readable(flag, 1) && *flag != 0;
     }
 
     // Resolves the local player's car entity for this frame, or 0.
@@ -132,7 +126,10 @@ static void NitrousUpdaterThread() {
 
     const int updateIntervalMs = 25;
     const DWORD cooldownMs = g_fastRefill ? 1000 : 2000;
-    const DWORD unpauseBufferMs = 500;
+    // The game freezes for roughly half a second right after unpausing.
+    // Refilling during that freeze shows up as an instant nitrous jump,
+    // so hold the refill for 1s total after unpausing.
+    const DWORD unpauseBufferMs = 1000;
 
     int lastNitroValue = -1;
     ULONGLONG lastDecreaseTime = 0;
@@ -210,10 +207,11 @@ static void NitrousUpdaterThread() {
         }
         lastNitroValue = currentValue;
 
-        // Speed as displayed on the HUD (mph or km/h depending on game options).
+        // Speed converted to mph. The tuning thresholds below (50-100) were
+        // authored for mph, so always use the mph scale regardless of what
+        // the HUD displays (the game's km/h option only affects the readout).
         const float speedMs = *reinterpret_cast<float*>(ent + game::ENT_SPEED_MS);
-        const float unitScale = game::IsMetricUnits(gameBase) ? 3.6f : 2.237f;
-        const int carSpeed = static_cast<int>(speedMs * unitScale);
+        const int carSpeed = static_cast<int>(speedMs * 2.237f);
 
         int minSpeed = g_fastRefill ? 20 : 50;
         int maxSpeed = g_fastRefill ? 140 : 100;
@@ -229,9 +227,13 @@ static void NitrousUpdaterThread() {
         double t = (clampedSpeed - minSpeed) / static_cast<double>(maxSpeed - minSpeed);
         double refillTime = minTime + t * (maxTime - minTime);
 
-        // 40 updates per second, so the increment restores a full bar in
-        // refillTime seconds of sustained speed.
-        int refillIncrement = static_cast<int>(maxNitro / (refillTime * 40));
+        // Scale by the real elapsed time so a full bar takes refillTime
+        // seconds regardless of how often the update loop actually runs
+        // (Sleep granularity makes it ~32 Hz instead of a nominal 40 Hz).
+        double dtSec = elapsedTime / 1000.0;
+        if (dtSec > 0.25) dtSec = 0.25;  // ignore huge gaps (loading, stalls)
+        int refillIncrement = static_cast<int>(maxNitro * dtSec / refillTime);
+        if (refillIncrement < 1) refillIncrement = 1;
         int actualMax = g_doubleNitrous ? maxNitro * 2 : maxNitro;
 
         if ((gameTime - lastDecreaseTime) >= cooldownMs && currentValue < actualMax) {
